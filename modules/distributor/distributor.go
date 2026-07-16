@@ -431,19 +431,15 @@ func (d *Distributor) checkForRateLimits(tracesSize, spanCount int, userID strin
 	return nil
 }
 
-func (d *Distributor) extractBasicInfo(ctx context.Context, traces ptrace.Traces) (userID string, spanCount, tracesSize int, encoded []byte, err error) {
+func (d *Distributor) extractBasicInfo(ctx context.Context, traces ptrace.Traces) (userID string, spanCount, tracesSize int, err error) {
 	orgID, e := validation.ExtractValidTenantID(ctx)
 	if e != nil {
-		return "", 0, 0, nil, status.Error(codes.InvalidArgument, e.Error())
+		return "", 0, 0, status.Error(codes.InvalidArgument, e.Error())
 	}
 
-	// Reuse this request-local encoding for admission size and the later wire-compatible conversion.
-	encoded, err = (&ptrace.ProtoMarshaler{}).MarshalTraces(traces)
-	if err != nil {
-		return "", 0, 0, nil, err
-	}
-
-	return orgID, traces.SpanCount(), len(encoded), encoded, nil
+	// Keep admission size-only so rate-limited requests are rejected before
+	// payload encoding allocates.
+	return orgID, traces.SpanCount(), (&ptrace.ProtoMarshaler{}).TracesSize(traces), nil
 }
 
 // PushTraces pushes a batch of traces
@@ -460,7 +456,7 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		}
 	}
 
-	userID, spanCount, size, encoded, err := d.extractBasicInfo(ctx, traces)
+	userID, spanCount, size, err := d.extractBasicInfo(ctx, traces)
 	if err != nil {
 		// can't record discarded spans here b/c there's no tenant
 		return nil, err
@@ -480,10 +476,17 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		return nil, err
 	}
 
+	// Convert to bytes and back. This is unfortunate for efficiency, but it works
+	// around the otel-collector internalization of otel-proto which Tempo also uses.
+	convert, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(traces)
+	if err != nil {
+		return nil, err
+	}
+
 	// tempopb.Trace is wire-compatible with ExportTraceServiceRequest
 	// used by ToOtlpProtoBytes
 	trace := tempopb.Trace{}
-	err = trace.Unmarshal(encoded)
+	err = trace.Unmarshal(convert)
 	if err != nil {
 		return nil, err
 	}
