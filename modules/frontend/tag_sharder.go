@@ -104,7 +104,6 @@ func (r *tagValueSearchRequest) newWithRange(start, end uint32) tagSearchReq {
 
 	return &tagValueSearchRequest{
 		request: newReq,
-		v2:      r.v2,
 	}
 }
 
@@ -379,7 +378,7 @@ func (s searchTagSharder) maxDuration(tenantID string) time.Duration {
 
 func (s searchTagSharder) directTagValuesSearch(searchReq tagSearchReq) bool {
 	tagValues, ok := searchReq.(*tagValueSearchRequest)
-	if !ok || !tagValues.v2 || s.overrides == nil {
+	if !ok || !tagValues.v2 {
 		return false
 	}
 
