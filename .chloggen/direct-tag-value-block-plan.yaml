@@ -1,0 +1,6 @@
+change_type: enhancement
+component: query-frontend
+note: Reduce repeated backend reads for unbounded vParquet4 tag-value lookups.
+issues: []
+subtext:
+user: "perfloop[bot]"
