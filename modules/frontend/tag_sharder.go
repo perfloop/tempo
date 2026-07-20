@@ -16,6 +16,7 @@ import (
 	"github.com/grafana/tempo/pkg/validation"
 	"github.com/grafana/tempo/tempodb"
 	"github.com/grafana/tempo/tempodb/backend"
+	"github.com/grafana/tempo/tempodb/encoding/vparquet4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/segmentio/fasthash/fnv1a"
 )
@@ -70,7 +71,7 @@ func (r *tagsSearchRequest) buildTagSearchBlockRequest(subR *http.Request, block
 	})
 }
 
-/* Tag value request implementation */
+/* TagValue V2 handler and request implementation */
 type tagValueSearchRequest struct {
 	request tempopb.SearchTagValuesRequest
 	v2      bool
@@ -277,7 +278,7 @@ func (s searchTagSharder) backendRequests(ctx context.Context, tenantID string, 
 	blocks := blockMetasForSearch(s.reader.BlockMetas(tenantID), startT, endT, acceptAllBlocks)
 
 	targetBytesPerRequest := s.cfg.TargetBytesPerRequest
-	directValues := s.directTagValuesSearch(searchReq)
+	directValues := directTagValuesSearch(searchReq)
 	// the callback function is nil, so we will use it just for counting the total number of jobs
 	totalJobs := iterateTagValueJobs(blocks, targetBytesPerRequest, directValues, nil)
 
@@ -376,34 +377,39 @@ func (s searchTagSharder) maxDuration(tenantID string) time.Duration {
 	return s.cfg.MaxDuration
 }
 
-func (s searchTagSharder) directTagValuesSearch(searchReq tagSearchReq) bool {
+func directTagValuesSearch(searchReq tagSearchReq) bool {
+	// Nonempty queries retain querier-side condition classification instead of
+	// parsing TraceQL again in the frontend. Bounded requests keep page jobs
+	// because their storage-side collector can stop before the frontend merges
+	// child responses.
 	tagValues, ok := searchReq.(*tagValueSearchRequest)
-	if !ok || !tagValues.v2 {
-		return false
-	}
-
-	conditionGroups, err := traceql.ExtractConditionGroups(tagValues.request.Query, s.overrides.MaxConditionGroupsPerTagQuery())
-	return err == nil && len(conditionGroups) == 0
+	return ok &&
+		tagValues.v2 &&
+		tagValues.request.Query == "" &&
+		tagValues.request.MaxTagValues == 0 &&
+		tagValues.request.StaleValueThreshold == 0
 }
 
 type tagJobIterFn func(m *backend.BlockMeta, startPage, pages int) bool
 
 func iterateTagValueJobs(metas []*backend.BlockMeta, bytesPerRequest int, directValues bool, jobIter tagJobIterFn) int {
-	if !directValues {
-		return iterateTagJobs(metas, bytesPerRequest, jobIter)
-	}
-
 	jobs := 0
 	for _, m := range metas {
-		// Preserve the existing eligibility checks before scheduling the one
-		// full-block direct-value job.
-		if pagesPerRequest(m, bytesPerRequest) == 0 {
+		pages := pagesPerRequest(m, bytesPerRequest)
+		if pages == 0 {
 			continue
 		}
 
-		jobs++
-		if jobIter != nil && !jobIter(m, 0, int(m.TotalRecords)) {
-			return jobs
+		// Keep other encodings on their existing page plan.
+		if directValues && m.Version == vparquet4.VersionString {
+			pages = int(m.TotalRecords)
+		}
+
+		for startPage := 0; startPage < int(m.TotalRecords); startPage += pages {
+			jobs++
+			if jobIter != nil && !jobIter(m, startPage, pages) {
+				return jobs
+			}
 		}
 	}
 

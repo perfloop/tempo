@@ -58,20 +58,63 @@ func TestTagValueV2BackendRequestsUseFullBlockJobs(t *testing.T) {
 	block.TotalRecords = 8
 
 	tests := []struct {
-		name            string
-		query           string
-		v2              bool
-		expectedJobs    int
-		pagesPerRequest int
+		name                string
+		version             string
+		query               string
+		maxTagValues        uint32
+		staleValueThreshold uint32
+		v2                  bool
+		expectedJobs        int
+		pagesPerRequest     int
 	}{
 		{
-			name:            "unfiltered v2",
+			name:            "unfiltered v2 vparquet4",
+			version:         "vParquet4",
 			v2:              true,
 			expectedJobs:    1,
 			pagesPerRequest: int(block.TotalRecords),
 		},
 		{
+			name:            "unfiltered v2 vparquet3",
+			version:         "vParquet3",
+			v2:              true,
+			expectedJobs:    int(block.TotalRecords),
+			pagesPerRequest: 1,
+		},
+		{
+			name:            "unfiltered v2 vparquet5",
+			version:         "vParquet5",
+			v2:              true,
+			expectedJobs:    int(block.TotalRecords),
+			pagesPerRequest: 1,
+		},
+		{
+			name:            "v2 match all query",
+			version:         "vParquet4",
+			query:           "{}",
+			v2:              true,
+			expectedJobs:    int(block.TotalRecords),
+			pagesPerRequest: 1,
+		},
+		{
+			name:            "v2 with max tag values",
+			version:         "vParquet4",
+			maxTagValues:    1,
+			v2:              true,
+			expectedJobs:    int(block.TotalRecords),
+			pagesPerRequest: 1,
+		},
+		{
+			name:                "v2 with stale value threshold",
+			version:             "vParquet4",
+			staleValueThreshold: 1,
+			v2:                  true,
+			expectedJobs:        int(block.TotalRecords),
+			pagesPerRequest:     1,
+		},
+		{
 			name:            "conditioned v2",
+			version:         "vParquet4",
 			query:           "{ resource.service.name = `test-service` }",
 			v2:              true,
 			expectedJobs:    int(block.TotalRecords),
@@ -79,6 +122,7 @@ func TestTagValueV2BackendRequestsUseFullBlockJobs(t *testing.T) {
 		},
 		{
 			name:            "unfiltered legacy endpoint",
+			version:         "vParquet4",
 			expectedJobs:    int(block.TotalRecords),
 			pagesPerRequest: 1,
 		},
@@ -86,17 +130,21 @@ func TestTagValueV2BackendRequestsUseFullBlockJobs(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			meta := *block
+			meta.Version = tc.version
 			s := searchTagSharder{
 				cfg:       SearchSharderConfig{TargetBytesPerRequest: defaultTargetBytesPerRequest},
-				reader:    &mockReader{metas: []*backend.BlockMeta{block}},
+				reader:    &mockReader{metas: []*backend.BlockMeta{&meta}},
 				overrides: o,
 			}
 			searchReq := &tagValueSearchRequest{
 				request: tempopb.SearchTagValuesRequest{
-					TagName: "resource.service.name",
-					Query:   tc.query,
-					Start:   99,
-					End:     201,
+					TagName:             "resource.service.name",
+					Query:               tc.query,
+					Start:               99,
+					End:                 201,
+					MaxTagValues:        tc.maxTagValues,
+					StaleValueThreshold: tc.staleValueThreshold,
 				},
 				v2: tc.v2,
 			}
