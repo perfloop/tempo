@@ -280,7 +280,7 @@ func (s searchTagSharder) backendRequests(ctx context.Context, tenantID string, 
 	targetBytesPerRequest := s.cfg.TargetBytesPerRequest
 	directValues := directTagValuesSearch(searchReq)
 	// the callback function is nil, so we will use it just for counting the total number of jobs
-	totalJobs := iterateTagValueJobs(blocks, targetBytesPerRequest, directValues, nil)
+	totalJobs := iterateTagJobs(blocks, targetBytesPerRequest, nil, directValues)
 
 	go func() {
 		s.buildBackendRequests(ctx, tenantID, parent, blocks, targetBytesPerRequest, directValues, reqCh, errFn, searchReq)
@@ -299,7 +299,7 @@ func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID str
 	startTime := time.Unix(int64(searchReq.start()), 0)
 	endTime := time.Unix(int64(searchReq.end()), 0)
 
-	iterateTagValueJobs(metas, bytesPerRequest, directValues, func(m *backend.BlockMeta, startPage, pages int) bool {
+	iterateTagJobs(metas, bytesPerRequest, func(m *backend.BlockMeta, startPage, pages int) bool {
 		blockID := m.BlockID.String()
 		pipelineR, err := cloneRequestforQueriers(parent, tenantID, func(r *http.Request) (*http.Request, error) {
 			return searchReq.buildTagSearchBlockRequest(r, blockID, startPage, pages, m)
@@ -318,7 +318,7 @@ func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID str
 		case <-ctx.Done():
 			return false
 		}
-	})
+	}, directValues)
 }
 
 // ingesterRequest returns a new start and end time range for the backend as well as a http request
@@ -392,38 +392,20 @@ func directTagValuesSearch(searchReq tagSearchReq) bool {
 
 type tagJobIterFn func(m *backend.BlockMeta, startPage, pages int) bool
 
-func iterateTagValueJobs(metas []*backend.BlockMeta, bytesPerRequest int, directValues bool, jobIter tagJobIterFn) int {
+// iterateTagJobs iterates page jobs and optionally replaces them with one
+// full-block job for an eligible direct tag-value request.
+func iterateTagJobs(metas []*backend.BlockMeta, bytesPerRequest int, jobIter tagJobIterFn, directValues ...bool) int {
+	directValuesSearch := len(directValues) > 0 && directValues[0]
 	jobs := 0
+
 	for _, m := range metas {
 		pages := pagesPerRequest(m, bytesPerRequest)
 		if pages == 0 {
 			continue
 		}
 
-		// Keep other encodings on their existing page plan.
-		if directValues && m.Version == vparquet4.VersionString {
+		if directValuesSearch && m.Version == vparquet4.VersionString {
 			pages = int(m.TotalRecords)
-		}
-
-		for startPage := 0; startPage < int(m.TotalRecords); startPage += pages {
-			jobs++
-			if jobIter != nil && !jobIter(m, startPage, pages) {
-				return jobs
-			}
-		}
-	}
-
-	return jobs
-}
-
-// Helper function to iterate over the blocks meta. If jobIter is not null it will execute it as a callback
-func iterateTagJobs(metas []*backend.BlockMeta, bytesPerRequest int, jobIter tagJobIterFn) int {
-	jobs := 0
-
-	for _, m := range metas {
-		pages := pagesPerRequest(m, bytesPerRequest)
-		if pages == 0 {
-			continue
 		}
 
 		for startPage := 0; startPage < int(m.TotalRecords); startPage += pages {
