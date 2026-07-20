@@ -70,9 +70,10 @@ func (r *tagsSearchRequest) buildTagSearchBlockRequest(subR *http.Request, block
 	})
 }
 
-/* TagValue V2 handler and request implementation */
+/* Tag value request implementation */
 type tagValueSearchRequest struct {
 	request tempopb.SearchTagValuesRequest
+	v2      bool
 }
 
 func (r *tagValueSearchRequest) start() uint32 {
@@ -103,6 +104,7 @@ func (r *tagValueSearchRequest) newWithRange(start, end uint32) tagSearchReq {
 
 	return &tagValueSearchRequest{
 		request: newReq,
+		v2:      r.v2,
 	}
 }
 
@@ -152,6 +154,7 @@ func parseTagValuesRequestV2(r *http.Request) (tagSearchReq, error) {
 	}
 	return &tagValueSearchRequest{
 		request: *searchReq,
+		v2:      true,
 	}, nil
 }
 
@@ -275,11 +278,12 @@ func (s searchTagSharder) backendRequests(ctx context.Context, tenantID string, 
 	blocks := blockMetasForSearch(s.reader.BlockMetas(tenantID), startT, endT, acceptAllBlocks)
 
 	targetBytesPerRequest := s.cfg.TargetBytesPerRequest
+	directValues := s.directTagValuesSearch(searchReq)
 	// the callback function is nil, so we will use it just for counting the total number of jobs
-	totalJobs := iterateTagJobs(blocks, targetBytesPerRequest, nil)
+	totalJobs := iterateTagValueJobs(blocks, targetBytesPerRequest, directValues, nil)
 
 	go func() {
-		s.buildBackendRequests(ctx, tenantID, parent, blocks, targetBytesPerRequest, reqCh, errFn, searchReq)
+		s.buildBackendRequests(ctx, tenantID, parent, blocks, targetBytesPerRequest, directValues, reqCh, errFn, searchReq)
 	}()
 
 	return totalJobs
@@ -287,7 +291,7 @@ func (s searchTagSharder) backendRequests(ctx context.Context, tenantID string, 
 
 // buildBackendRequests returns a slice of requests that cover all blocks in the store
 // that are covered by start/end.
-func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID string, parent pipeline.Request, metas []*backend.BlockMeta, bytesPerRequest int, reqCh chan<- pipeline.Request, errFn func(error), searchReq tagSearchReq) {
+func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID string, parent pipeline.Request, metas []*backend.BlockMeta, bytesPerRequest int, directValues bool, reqCh chan<- pipeline.Request, errFn func(error), searchReq tagSearchReq) {
 	defer close(reqCh)
 
 	hash := searchReq.hash()
@@ -295,7 +299,7 @@ func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID str
 	startTime := time.Unix(int64(searchReq.start()), 0)
 	endTime := time.Unix(int64(searchReq.end()), 0)
 
-	iterateTagJobs(metas, bytesPerRequest, func(m *backend.BlockMeta, startPage, pages int) bool {
+	iterateTagValueJobs(metas, bytesPerRequest, directValues, func(m *backend.BlockMeta, startPage, pages int) bool {
 		blockID := m.BlockID.String()
 		pipelineR, err := cloneRequestforQueriers(parent, tenantID, func(r *http.Request) (*http.Request, error) {
 			return searchReq.buildTagSearchBlockRequest(r, blockID, startPage, pages, m)
@@ -373,7 +377,39 @@ func (s searchTagSharder) maxDuration(tenantID string) time.Duration {
 	return s.cfg.MaxDuration
 }
 
+func (s searchTagSharder) directTagValuesSearch(searchReq tagSearchReq) bool {
+	tagValues, ok := searchReq.(*tagValueSearchRequest)
+	if !ok || !tagValues.v2 || s.overrides == nil {
+		return false
+	}
+
+	conditionGroups, err := traceql.ExtractConditionGroups(tagValues.request.Query, s.overrides.MaxConditionGroupsPerTagQuery())
+	return err == nil && len(conditionGroups) == 0
+}
+
 type tagJobIterFn func(m *backend.BlockMeta, startPage, pages int) bool
+
+func iterateTagValueJobs(metas []*backend.BlockMeta, bytesPerRequest int, directValues bool, jobIter tagJobIterFn) int {
+	if !directValues {
+		return iterateTagJobs(metas, bytesPerRequest, jobIter)
+	}
+
+	jobs := 0
+	for _, m := range metas {
+		// Preserve the existing eligibility checks before scheduling the one
+		// full-block direct-value job.
+		if pagesPerRequest(m, bytesPerRequest) == 0 {
+			continue
+		}
+
+		jobs++
+		if jobIter != nil && !jobIter(m, 0, int(m.TotalRecords)) {
+			return jobs
+		}
+	}
+
+	return jobs
+}
 
 // Helper function to iterate over the blocks meta. If jobIter is not null it will execute it as a callback
 func iterateTagJobs(metas []*backend.BlockMeta, bytesPerRequest int, jobIter tagJobIterFn) int {

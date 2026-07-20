@@ -47,6 +47,90 @@ func TestTagValueSearchRequestHashIncludesLimits(t *testing.T) {
 	require.NotEqual(t, base.hash(), withStale.hash(), "hash must vary with StaleValueThreshold")
 }
 
+func TestTagValueV2BackendRequestsUseFullBlockJobs(t *testing.T) {
+	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	block := backend.NewBlockMeta("test", uuid.New(), "vParquet4")
+	block.StartTime = time.Unix(100, 0)
+	block.EndTime = time.Unix(200, 0)
+	block.Size_ = uint64(defaultTargetBytesPerRequest * 8)
+	block.TotalRecords = 8
+
+	tests := []struct {
+		name            string
+		query           string
+		v2              bool
+		expectedJobs    int
+		pagesPerRequest int
+	}{
+		{
+			name:            "unfiltered v2",
+			v2:              true,
+			expectedJobs:    1,
+			pagesPerRequest: int(block.TotalRecords),
+		},
+		{
+			name:            "conditioned v2",
+			query:           "{ resource.service.name = `test-service` }",
+			v2:              true,
+			expectedJobs:    int(block.TotalRecords),
+			pagesPerRequest: 1,
+		},
+		{
+			name:            "unfiltered legacy endpoint",
+			expectedJobs:    int(block.TotalRecords),
+			pagesPerRequest: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := searchTagSharder{
+				cfg:       SearchSharderConfig{TargetBytesPerRequest: defaultTargetBytesPerRequest},
+				reader:    &mockReader{metas: []*backend.BlockMeta{block}},
+				overrides: o,
+			}
+			searchReq := &tagValueSearchRequest{
+				request: tempopb.SearchTagValuesRequest{
+					TagName: "resource.service.name",
+					Query:   tc.query,
+					Start:   99,
+					End:     201,
+				},
+				v2: tc.v2,
+			}
+
+			reqCh := make(chan pipeline.Request)
+			jobs := s.backendRequests(context.Background(), "test", pipeline.NewHTTPRequest(httptest.NewRequest(http.MethodGet, "/querier?start=99&end=201", nil)), searchReq, reqCh, func(err error) {
+				t.Errorf("building backend request: %v", err)
+			})
+
+			var requests []pipeline.Request
+			for request := range reqCh {
+				requests = append(requests, request)
+			}
+
+			require.Equal(t, tc.expectedJobs, jobs)
+			require.Len(t, requests, tc.expectedJobs)
+
+			cacheKeys := make(map[string]struct{}, len(requests))
+			for i, request := range requests {
+				values := request.HTTPRequest().URL.Query()
+				startPage, err := strconv.Atoi(values.Get("startPage"))
+				require.NoError(t, err)
+				pages, err := strconv.Atoi(values.Get("pagesToSearch"))
+				require.NoError(t, err)
+				require.Equal(t, i*tc.pagesPerRequest, startPage)
+				require.Equal(t, tc.pagesPerRequest, pages)
+				require.NotEmpty(t, request.CacheKey())
+				cacheKeys[request.CacheKey()] = struct{}{}
+			}
+			require.Len(t, cacheKeys, tc.expectedJobs)
+		})
+	}
+}
+
 type fakeReq struct {
 	startValue uint32
 	endValue   uint32
