@@ -45,6 +45,10 @@ func TestTagValueSearchRequestHashIncludesLimits(t *testing.T) {
 
 	require.NotEqual(t, base.hash(), withLimit.hash(), "hash must vary with MaxTagValues")
 	require.NotEqual(t, base.hash(), withStale.hash(), "hash must vary with StaleValueThreshold")
+
+	emptyQuery := newReq(func(r *tempopb.SearchTagValuesRequest) { r.Query = "" })
+	matchAllQuery := newReq(func(r *tempopb.SearchTagValuesRequest) { r.Query = "{ true }" })
+	require.Equal(t, emptyQuery.hash(), matchAllQuery.hash(), "match-all queries must share a cache key")
 }
 
 type fakeReq struct {

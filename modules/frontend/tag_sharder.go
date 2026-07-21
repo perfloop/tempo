@@ -73,6 +73,7 @@ func (r *tagsSearchRequest) buildTagSearchBlockRequest(subR *http.Request, block
 /* TagValue V2 handler and request implementation */
 type tagValueSearchRequest struct {
 	request tempopb.SearchTagValuesRequest
+	v2      bool
 }
 
 func (r *tagValueSearchRequest) start() uint32 {
@@ -85,7 +86,13 @@ func (r *tagValueSearchRequest) end() uint32 {
 
 func (r *tagValueSearchRequest) hash() uint64 {
 	hash := fnv1a.HashString64(r.request.TagName)
-	hash = fnv1a.AddString64(hash, traceql.NormalizeQuery(r.request.Query))
+	query := r.request.Query
+	if traceql.IsEmptyQuery(query) {
+		query = "{}"
+	} else {
+		query = traceql.NormalizeQuery(query)
+	}
+	hash = fnv1a.AddString64(hash, query)
 	hash = fnv1a.AddUint64(hash, uint64(r.request.MaxTagValues))
 	hash = fnv1a.AddUint64(hash, uint64(r.request.StaleValueThreshold))
 
@@ -103,6 +110,7 @@ func (r *tagValueSearchRequest) newWithRange(start, end uint32) tagSearchReq {
 
 	return &tagValueSearchRequest{
 		request: newReq,
+		v2:      r.v2,
 	}
 }
 
@@ -152,6 +160,7 @@ func parseTagValuesRequestV2(r *http.Request) (tagSearchReq, error) {
 	}
 	return &tagValueSearchRequest{
 		request: *searchReq,
+		v2:      true,
 	}, nil
 }
 
@@ -275,11 +284,19 @@ func (s searchTagSharder) backendRequests(ctx context.Context, tenantID string, 
 	blocks := blockMetasForSearch(s.reader.BlockMetas(tenantID), startT, endT, acceptAllBlocks)
 
 	targetBytesPerRequest := s.cfg.TargetBytesPerRequest
-	// the callback function is nil, so we will use it just for counting the total number of jobs
-	totalJobs := iterateTagJobs(blocks, targetBytesPerRequest, nil)
+	fullBlockPlan := s.useFullBlockTagValuePlan(searchReq)
+
+	// The callback function is nil, so use it only to count the total number of jobs.
+	// The direct tag-value path scans every row group, so one request per block is enough.
+	var totalJobs int
+	if fullBlockPlan {
+		totalJobs = iterateTagBlocks(blocks, nil)
+	} else {
+		totalJobs = iterateTagJobs(blocks, targetBytesPerRequest, nil)
+	}
 
 	go func() {
-		s.buildBackendRequests(ctx, tenantID, parent, blocks, targetBytesPerRequest, reqCh, errFn, searchReq)
+		s.buildBackendRequests(ctx, tenantID, parent, blocks, targetBytesPerRequest, fullBlockPlan, reqCh, errFn, searchReq)
 	}()
 
 	return totalJobs
@@ -287,7 +304,7 @@ func (s searchTagSharder) backendRequests(ctx context.Context, tenantID string, 
 
 // buildBackendRequests returns a slice of requests that cover all blocks in the store
 // that are covered by start/end.
-func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID string, parent pipeline.Request, metas []*backend.BlockMeta, bytesPerRequest int, reqCh chan<- pipeline.Request, errFn func(error), searchReq tagSearchReq) {
+func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID string, parent pipeline.Request, metas []*backend.BlockMeta, bytesPerRequest int, fullBlockPlan bool, reqCh chan<- pipeline.Request, errFn func(error), searchReq tagSearchReq) {
 	defer close(reqCh)
 
 	hash := searchReq.hash()
@@ -295,7 +312,7 @@ func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID str
 	startTime := time.Unix(int64(searchReq.start()), 0)
 	endTime := time.Unix(int64(searchReq.end()), 0)
 
-	iterateTagJobs(metas, bytesPerRequest, func(m *backend.BlockMeta, startPage, pages int) bool {
+	buildRequest := func(m *backend.BlockMeta, startPage, pages int) bool {
 		blockID := m.BlockID.String()
 		pipelineR, err := cloneRequestforQueriers(parent, tenantID, func(r *http.Request) (*http.Request, error) {
 			return searchReq.buildTagSearchBlockRequest(r, blockID, startPage, pages, m)
@@ -314,7 +331,13 @@ func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID str
 		case <-ctx.Done():
 			return false
 		}
-	})
+	}
+
+	if fullBlockPlan {
+		iterateTagBlocks(metas, buildRequest)
+		return
+	}
+	iterateTagJobs(metas, bytesPerRequest, buildRequest)
 }
 
 // ingesterRequest returns a new start and end time range for the backend as well as a http request
@@ -374,6 +397,38 @@ func (s searchTagSharder) maxDuration(tenantID string) time.Duration {
 }
 
 type tagJobIterFn func(m *backend.BlockMeta, startPage, pages int) bool
+
+// useFullBlockTagValuePlan reports whether the queried direct V2 path scans whole blocks.
+func (s searchTagSharder) useFullBlockTagValuePlan(searchReq tagSearchReq) bool {
+	tagValuesReq, ok := searchReq.(*tagValueSearchRequest)
+	if !ok || !tagValuesReq.v2 {
+		return false
+	}
+	if traceql.IsEmptyQuery(tagValuesReq.request.Query) {
+		return true
+	}
+
+	conditionGroups, err := traceql.ExtractConditionGroups(tagValuesReq.request.Query, s.overrides.MaxConditionGroupsPerTagQuery())
+	return err == nil && len(conditionGroups) == 0
+}
+
+// iterateTagBlocks emits one whole-block job for every block that the page planner would search.
+func iterateTagBlocks(metas []*backend.BlockMeta, jobIter tagJobIterFn) int {
+	jobs := 0
+
+	for _, m := range metas {
+		if m.Size_ == 0 || m.TotalRecords == 0 {
+			continue
+		}
+
+		jobs++
+		if jobIter != nil && !jobIter(m, 0, int(m.TotalRecords)) {
+			return jobs
+		}
+	}
+
+	return jobs
+}
 
 // Helper function to iterate over the blocks meta. If jobIter is not null it will execute it as a callback
 func iterateTagJobs(metas []*backend.BlockMeta, bytesPerRequest int, jobIter tagJobIterFn) int {
