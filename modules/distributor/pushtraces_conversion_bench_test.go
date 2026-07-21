@@ -48,30 +48,6 @@ func BenchmarkPushTracesAcceptedNormalBatch(b *testing.B) {
 	}
 }
 
-// BenchmarkPdataToTempopbWireBridge keeps the production wire bridge isolated
-// for CPU and allocation-profile attribution. It consumes the decoded graph so
-// the marshaling and unmarshaling work cannot be optimized away.
-func BenchmarkPdataToTempopbWireBridge(b *testing.B) {
-	traces := makePushTracesBenchmarkTraces(b)
-	marshaler := ptrace.ProtoMarshaler{}
-
-	b.ReportAllocs()
-	for b.Loop() {
-		encoded, err := marshaler.MarshalTraces(traces)
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		decoded := tempopb.Trace{}
-		if err := decoded.Unmarshal(encoded); err != nil {
-			b.Fatal(err)
-		}
-		if len(decoded.ResourceSpans) != 1 {
-			b.Fatalf("expected one resource batch, got %d", len(decoded.ResourceSpans))
-		}
-	}
-}
-
 // TestPushTracesPreservesRebatchedDataAndPdataOwnership compares the produced
 // rebatched graph with the established wire-compatible conversion and verifies
 // that attribute truncation cannot mutate pdata subsequently sent to forwarders.
