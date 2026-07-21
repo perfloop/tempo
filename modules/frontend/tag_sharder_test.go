@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strconv"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -23,6 +25,7 @@ import (
 	"github.com/grafana/tempo/modules/frontend/combiner"
 	"github.com/grafana/tempo/modules/frontend/pipeline"
 	"github.com/grafana/tempo/modules/overrides"
+	"github.com/grafana/tempo/pkg/api"
 	"github.com/grafana/tempo/pkg/tempopb"
 	"github.com/grafana/tempo/tempodb/backend"
 )
@@ -49,6 +52,111 @@ func TestTagValueSearchRequestHashIncludesLimits(t *testing.T) {
 	emptyQuery := newReq(func(r *tempopb.SearchTagValuesRequest) { r.Query = "" })
 	matchAllQuery := newReq(func(r *tempopb.SearchTagValuesRequest) { r.Query = "{ true }" })
 	require.Equal(t, emptyQuery.hash(), matchAllQuery.hash(), "match-all queries must share a cache key")
+}
+
+const tagValuePlanRegressionPageCount = uint32(16)
+
+func tagValuePlanRegressionMeta() *backend.BlockMeta {
+	return &backend.BlockMeta{
+		StartTime:    time.Unix(100, 0),
+		EndTime:      time.Unix(200, 0),
+		Size_:        uint64(defaultTargetBytesPerRequest) * uint64(tagValuePlanRegressionPageCount),
+		TotalRecords: tagValuePlanRegressionPageCount,
+		BlockID:      backend.MustParse("00000000-0000-0000-0000-000000000456"),
+		Version:      "vParquet4",
+	}
+}
+
+func newTagValuePlanRegressionRequest(t testing.TB, query string) *http.Request {
+	t.Helper()
+
+	values := url.Values{
+		"start": []string{"100"},
+		"end":   []string{"200"},
+		"q":     []string{query},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/search/tag/.service.name/values?"+values.Encode(), nil)
+	return mux.SetURLVars(req, map[string]string{api.MuxVarTagName: ".service.name"})
+}
+
+func tagValuePlanRegressionRequests(t testing.TB, parentRequest *http.Request, searchReq tagSearchReq) []pipeline.Request {
+	t.Helper()
+
+	o, err := overrides.NewOverrides(overrides.Config{}, nil, prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	sharder := searchTagSharder{
+		cfg: SearchSharderConfig{
+			TargetBytesPerRequest: defaultTargetBytesPerRequest,
+		},
+		reader:    &mockReader{metas: []*backend.BlockMeta{tagValuePlanRegressionMeta()}},
+		overrides: o,
+	}
+
+	reqCh := make(chan pipeline.Request)
+	totalJobs := sharder.backendRequests(
+		context.Background(),
+		"tenant",
+		pipeline.NewHTTPRequest(parentRequest),
+		searchReq,
+		reqCh,
+		func(error) {},
+	)
+
+	var requests []pipeline.Request
+	for req := range reqCh {
+		requests = append(requests, req)
+	}
+	require.Equal(t, totalJobs, len(requests))
+	return requests
+}
+
+func TestParseTagValuesRequestV2MarksFullBlockBackendPlan(t *testing.T) {
+	parentRequest := newTagValuePlanRegressionRequest(t, "{}")
+	searchReq, err := parseTagValuesRequestV2(parentRequest)
+	require.NoError(t, err)
+
+	tagValuesReq, ok := searchReq.(*tagValueSearchRequest)
+	require.True(t, ok)
+	require.True(t, tagValuesReq.v2)
+
+	requests := tagValuePlanRegressionRequests(t, parentRequest, searchReq)
+	require.Len(t, requests, 1)
+
+	blockReq, err := api.ParseSearchTagValuesBlockRequestV2(requests[0].HTTPRequest())
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), blockReq.StartPage)
+	require.Equal(t, tagValuePlanRegressionPageCount, blockReq.PagesToSearch)
+}
+
+func TestTagValueV2ConditionalBackendPlanKeepsPageRanges(t *testing.T) {
+	parentRequest := newTagValuePlanRegressionRequest(t, `{ .service.name = "checkout" }`)
+	searchReq, err := parseTagValuesRequestV2(parentRequest)
+	require.NoError(t, err)
+
+	requests := tagValuePlanRegressionRequests(t, parentRequest, searchReq)
+	require.Len(t, requests, int(tagValuePlanRegressionPageCount))
+	for page, req := range requests {
+		blockReq, err := api.ParseSearchTagValuesBlockRequestV2(req.HTTPRequest())
+		require.NoError(t, err)
+		require.Equal(t, uint32(page), blockReq.StartPage)
+		require.Equal(t, uint32(1), blockReq.PagesToSearch)
+	}
+}
+
+func TestTagValueV1BackendPlanKeepsPageRanges(t *testing.T) {
+	parentRequest := newTagValuePlanRegressionRequest(t, "{}")
+	searchReq, err := parseTagValuesRequest(parentRequest)
+	require.NoError(t, err)
+
+	requests := tagValuePlanRegressionRequests(t, parentRequest, searchReq)
+	require.Len(t, requests, int(tagValuePlanRegressionPageCount))
+	for page, req := range requests {
+		blockReq, err := api.ParseSearchTagValuesBlockRequest(req.HTTPRequest())
+		require.NoError(t, err)
+		require.Equal(t, uint32(page), blockReq.StartPage)
+		require.Equal(t, uint32(1), blockReq.PagesToSearch)
+	}
 }
 
 type fakeReq struct {
