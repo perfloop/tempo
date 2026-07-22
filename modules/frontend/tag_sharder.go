@@ -86,13 +86,7 @@ func (r *tagValueSearchRequest) end() uint32 {
 
 func (r *tagValueSearchRequest) hash() uint64 {
 	hash := fnv1a.HashString64(r.request.TagName)
-	query := r.request.Query
-	if traceql.IsEmptyQuery(query) {
-		query = "{}"
-	} else {
-		query = traceql.NormalizeQuery(query)
-	}
-	hash = fnv1a.AddString64(hash, query)
+	hash = fnv1a.AddString64(hash, traceql.NormalizeQuery(r.request.Query))
 	hash = fnv1a.AddUint64(hash, uint64(r.request.MaxTagValues))
 	hash = fnv1a.AddUint64(hash, uint64(r.request.StaleValueThreshold))
 
@@ -110,7 +104,6 @@ func (r *tagValueSearchRequest) newWithRange(start, end uint32) tagSearchReq {
 
 	return &tagValueSearchRequest{
 		request: newReq,
-		v2:      r.v2,
 	}
 }
 
@@ -284,19 +277,14 @@ func (s searchTagSharder) backendRequests(ctx context.Context, tenantID string, 
 	blocks := blockMetasForSearch(s.reader.BlockMetas(tenantID), startT, endT, acceptAllBlocks)
 
 	targetBytesPerRequest := s.cfg.TargetBytesPerRequest
-	fullBlockPlan := s.useFullBlockTagValuePlan(searchReq)
+	directValues := s.useFullBlockTagValuePlan(searchReq)
 
 	// The callback function is nil, so use it only to count the total number of jobs.
 	// The direct tag-value path scans every row group, so one request per block is enough.
-	var totalJobs int
-	if fullBlockPlan {
-		totalJobs = iterateTagBlocks(blocks, nil)
-	} else {
-		totalJobs = iterateTagJobs(blocks, targetBytesPerRequest, nil)
-	}
+	totalJobs := iterateTagJobs(blocks, targetBytesPerRequest, directValues, nil)
 
 	go func() {
-		s.buildBackendRequests(ctx, tenantID, parent, blocks, targetBytesPerRequest, fullBlockPlan, reqCh, errFn, searchReq)
+		s.buildBackendRequests(ctx, tenantID, parent, blocks, targetBytesPerRequest, directValues, reqCh, errFn, searchReq)
 	}()
 
 	return totalJobs
@@ -304,7 +292,7 @@ func (s searchTagSharder) backendRequests(ctx context.Context, tenantID string, 
 
 // buildBackendRequests returns a slice of requests that cover all blocks in the store
 // that are covered by start/end.
-func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID string, parent pipeline.Request, metas []*backend.BlockMeta, bytesPerRequest int, fullBlockPlan bool, reqCh chan<- pipeline.Request, errFn func(error), searchReq tagSearchReq) {
+func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID string, parent pipeline.Request, metas []*backend.BlockMeta, bytesPerRequest int, directValues bool, reqCh chan<- pipeline.Request, errFn func(error), searchReq tagSearchReq) {
 	defer close(reqCh)
 
 	hash := searchReq.hash()
@@ -333,11 +321,7 @@ func (s searchTagSharder) buildBackendRequests(ctx context.Context, tenantID str
 		}
 	}
 
-	if fullBlockPlan {
-		iterateTagBlocks(metas, buildRequest)
-		return
-	}
-	iterateTagJobs(metas, bytesPerRequest, buildRequest)
+	iterateTagJobs(metas, bytesPerRequest, directValues, buildRequest)
 }
 
 // ingesterRequest returns a new start and end time range for the backend as well as a http request
@@ -412,32 +396,17 @@ func (s searchTagSharder) useFullBlockTagValuePlan(searchReq tagSearchReq) bool 
 	return err == nil && len(conditionGroups) == 0
 }
 
-// iterateTagBlocks emits one whole-block job for every block that the page planner would search.
-func iterateTagBlocks(metas []*backend.BlockMeta, jobIter tagJobIterFn) int {
-	jobs := 0
-
-	for _, m := range metas {
-		if m.Size_ == 0 || m.TotalRecords == 0 {
-			continue
-		}
-
-		jobs++
-		if jobIter != nil && !jobIter(m, 0, int(m.TotalRecords)) {
-			return jobs
-		}
-	}
-
-	return jobs
-}
-
-// Helper function to iterate over the blocks meta. If jobIter is not null it will execute it as a callback
-func iterateTagJobs(metas []*backend.BlockMeta, bytesPerRequest int, jobIter tagJobIterFn) int {
+// iterateTagJobs emits page jobs unless directValues is true, in which case it emits one whole-block job.
+func iterateTagJobs(metas []*backend.BlockMeta, bytesPerRequest int, directValues bool, jobIter tagJobIterFn) int {
 	jobs := 0
 
 	for _, m := range metas {
 		pages := pagesPerRequest(m, bytesPerRequest)
 		if pages == 0 {
 			continue
+		}
+		if directValues {
+			pages = int(m.TotalRecords)
 		}
 
 		for startPage := 0; startPage < int(m.TotalRecords); startPage += pages {

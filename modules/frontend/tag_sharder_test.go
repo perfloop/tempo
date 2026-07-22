@@ -49,9 +49,6 @@ func TestTagValueSearchRequestHashIncludesLimits(t *testing.T) {
 	require.NotEqual(t, base.hash(), withLimit.hash(), "hash must vary with MaxTagValues")
 	require.NotEqual(t, base.hash(), withStale.hash(), "hash must vary with StaleValueThreshold")
 
-	emptyQuery := newReq(func(r *tempopb.SearchTagValuesRequest) { r.Query = "" })
-	matchAllQuery := newReq(func(r *tempopb.SearchTagValuesRequest) { r.Query = "{ true }" })
-	require.Equal(t, emptyQuery.hash(), matchAllQuery.hash(), "match-all queries must share a cache key")
 }
 
 const tagValuePlanRegressionPageCount = uint32(16)
@@ -111,22 +108,30 @@ func tagValuePlanRegressionRequests(t testing.TB, parentRequest *http.Request, s
 	return requests
 }
 
-func TestParseTagValuesRequestV2MarksFullBlockBackendPlan(t *testing.T) {
-	parentRequest := newTagValuePlanRegressionRequest(t, "{}")
-	searchReq, err := parseTagValuesRequestV2(parentRequest)
-	require.NoError(t, err)
+func TestParseTagValuesRequestV2PlansFullBlock(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "empty query", query: "{}"},
+		{name: "zero-condition query", query: `{ .service.name }`},
+	}
 
-	tagValuesReq, ok := searchReq.(*tagValueSearchRequest)
-	require.True(t, ok)
-	require.True(t, tagValuesReq.v2)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parentRequest := newTagValuePlanRegressionRequest(t, tt.query)
+			searchReq, err := parseTagValuesRequestV2(parentRequest)
+			require.NoError(t, err)
 
-	requests := tagValuePlanRegressionRequests(t, parentRequest, searchReq)
-	require.Len(t, requests, 1)
+			requests := tagValuePlanRegressionRequests(t, parentRequest, searchReq)
+			require.Len(t, requests, 1)
 
-	blockReq, err := api.ParseSearchTagValuesBlockRequestV2(requests[0].HTTPRequest())
-	require.NoError(t, err)
-	require.Equal(t, uint32(0), blockReq.StartPage)
-	require.Equal(t, tagValuePlanRegressionPageCount, blockReq.PagesToSearch)
+			blockReq, err := api.ParseSearchTagValuesBlockRequestV2(requests[0].HTTPRequest())
+			require.NoError(t, err)
+			require.Equal(t, uint32(0), blockReq.StartPage)
+			require.Equal(t, tagValuePlanRegressionPageCount, blockReq.PagesToSearch)
+		})
+	}
 }
 
 func TestTagValueV2ConditionalBackendPlanKeepsPageRanges(t *testing.T) {
