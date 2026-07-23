@@ -531,6 +531,7 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 			if d.cfg.LogDiscardedSpans.Enabled {
 				discarded := tempopb.Trace{}
 				_ = discarded.Unmarshal(convert)
+				truncateDiscardedResourceSpans(discarded.ResourceSpans, maxAttributeBytes)
 				logDiscardedResourceSpans(discarded.ResourceSpans, userID, &d.cfg.LogDiscardedSpans, d.logger)
 			}
 			return nil, err
@@ -860,6 +861,39 @@ func requestsByTraceID(batches []*v1.ResourceSpans, userID string, spanCount, ma
 		return ringTokens, traces, truncatedCount, &truncationExample, nil
 	}
 	return ringTokens, traces, truncatedCount, nil, nil
+}
+
+// truncateDiscardedResourceSpans applies the same pre-validation truncation as
+// requestsByTraceID before logging a direct-rebatch rejection. It stops at the
+// first invalid ID because legacy rebatching does too.
+func truncateDiscardedResourceSpans(batches []*v1.ResourceSpans, maxAttrSize int) {
+	if maxAttrSize <= 0 {
+		return
+	}
+
+	var truncationExample truncatedAttrInfo
+	for _, batch := range batches {
+		if batch.Resource != nil {
+			processAttributes(batch.Resource.Attributes, maxAttrSize, &truncationExample, "resource")
+		}
+		for _, scopeSpans := range batch.ScopeSpans {
+			if scopeSpans.Scope != nil {
+				processAttributes(scopeSpans.Scope.Attributes, maxAttrSize, &truncationExample, "scope")
+			}
+			for _, span := range scopeSpans.Spans {
+				processAttributes(span.Attributes, maxAttrSize, &truncationExample, "span")
+				for _, event := range span.Events {
+					processAttributes(event.Attributes, maxAttrSize, &truncationExample, "event")
+				}
+				for _, link := range span.Links {
+					processAttributes(link.Attributes, maxAttrSize, &truncationExample, "link")
+				}
+				if !validation.ValidTraceID(span.TraceId) || !validation.ValidSpanID(span.SpanId) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // processAttributes finds and truncates attribute keys/values that exceed maxAttrSize.

@@ -1467,31 +1467,49 @@ func TestLogReceivedSpans(t *testing.T) {
 	}
 }
 
-func TestLogDiscardedSpansDecodesOnlyRejectedPdata(t *testing.T) {
+func TestLogDiscardedSpansMatchesLegacyTruncation(t *testing.T) {
 	limits := overrides.Config{}
 	limits.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
 
-	buf := &bytes.Buffer{}
-	d := prepare(t, limits, kitlog.NewJSONLogger(kitlog.NewSyncWriter(buf)))
-	d.cfg.LogDiscardedSpans.Enabled = true
-	if d.requiresLegacyTraceBatches() {
+	newDistributor := func(logger kitlog.Logger) *Distributor {
+		d := prepare(t, limits, logger)
+		d.cfg.LogDiscardedSpans = LogSpansConfig{Enabled: true, IncludeAllAttributes: true}
+		d.cfg.MaxAttributeBytes = 4
+		return d
+	}
+
+	directLog := &bytes.Buffer{}
+	direct := newDistributor(kitlog.NewJSONLogger(kitlog.NewSyncWriter(directLog)))
+	if direct.requiresLegacyTraceBatches() {
 		t.Fatal("discarded-span logging unexpectedly requires legacy rebatching")
 	}
 
-	span := makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "discarded span", nil)
+	legacyLog := &bytes.Buffer{}
+	legacy := newDistributor(kitlog.NewJSONLogger(kitlog.NewSyncWriter(legacyLog)))
+	legacy.cfg.MetricReceivedSpans.Enabled = true
+	if !legacy.requiresLegacyTraceBatches() {
+		t.Fatal("received-span metrics unexpectedly skipped legacy rebatching")
+	}
+
+	span := makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "discarded span", nil,
+		makeAttribute("span-oversized-key", "span-oversized-value"))
 	span.SpanId = make([]byte, 8)
 	traces := batchesToTraces(t, []*v1.ResourceSpans{
-		makeResourceSpans("test-service", []*v1.ScopeSpans{makeScope(span)}),
+		makeResourceSpans("test-service", []*v1.ScopeSpans{makeScope(span)},
+			makeAttribute("resource-oversized-key", "resource-oversized-value")),
 	})
-	_, err := d.PushTraces(ctx, traces)
+
+	_, err := direct.PushTraces(ctx, traces)
 	require.Error(t, err)
-	assert.ElementsMatch(t, []testLogSpan{{
-		Msg:     "discarded",
-		Level:   "info",
-		Tenant:  "test",
-		TraceID: "0a0102030405060708090a0b0c0d0e0f",
-		SpanID:  "",
-	}}, actualLogSpan(t, buf))
+	_, err = legacy.PushTraces(ctx, traces)
+	require.Error(t, err)
+
+	assert.Equal(t, legacyLog.String(), directLog.String())
+	assert.Contains(t, directLog.String(), `"msg":"discarded"`)
+	assert.Contains(t, directLog.String(), `"span_reso":"reso"`)
+	assert.Contains(t, directLog.String(), `"span_span":"span"`)
+	assert.NotContains(t, directLog.String(), "resource-oversized")
+	assert.NotContains(t, directLog.String(), "span-oversized")
 }
 
 func actualLogSpan(t *testing.T, buf *bytes.Buffer) []testLogSpan {
