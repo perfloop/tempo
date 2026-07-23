@@ -528,6 +528,11 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		statSpansReceived.Inc(int64(spanCount))
 		ringTokens, rebatchedTraces, truncatedAttributesCount, truncationExample, err = requestsByTraceIDFromPdata(traces, userID, spanCount, maxAttributeBytes)
 		if err != nil {
+			if d.cfg.LogDiscardedSpans.Enabled {
+				discarded := tempopb.Trace{}
+				_ = discarded.Unmarshal(convert)
+				logDiscardedResourceSpans(discarded.ResourceSpans, userID, &d.cfg.LogDiscardedSpans, d.logger)
+			}
 			return nil, err
 		}
 	}

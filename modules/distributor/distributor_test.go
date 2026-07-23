@@ -1467,6 +1467,33 @@ func TestLogReceivedSpans(t *testing.T) {
 	}
 }
 
+func TestLogDiscardedSpansDecodesOnlyRejectedPdata(t *testing.T) {
+	limits := overrides.Config{}
+	limits.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+
+	buf := &bytes.Buffer{}
+	d := prepare(t, limits, kitlog.NewJSONLogger(kitlog.NewSyncWriter(buf)))
+	d.cfg.LogDiscardedSpans.Enabled = true
+	if d.requiresLegacyTraceBatches() {
+		t.Fatal("discarded-span logging unexpectedly requires legacy rebatching")
+	}
+
+	span := makeSpan("0a0102030405060708090a0b0c0d0e0f", "dad44adc9a83b370", "discarded span", nil)
+	span.SpanId = make([]byte, 8)
+	traces := batchesToTraces(t, []*v1.ResourceSpans{
+		makeResourceSpans("test-service", []*v1.ScopeSpans{makeScope(span)}),
+	})
+	_, err := d.PushTraces(ctx, traces)
+	require.Error(t, err)
+	assert.ElementsMatch(t, []testLogSpan{{
+		Msg:     "discarded",
+		Level:   "info",
+		Tenant:  "test",
+		TraceID: "0a0102030405060708090a0b0c0d0e0f",
+		SpanID:  "",
+	}}, actualLogSpan(t, buf))
+}
+
 func actualLogSpan(t *testing.T, buf *bytes.Buffer) []testLogSpan {
 	bufJSON := "[" + strings.TrimRight(strings.ReplaceAll(buf.String(), "\n", ","), ",") + "]"
 	var actualLogsSpan []testLogSpan

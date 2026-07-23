@@ -26,7 +26,6 @@ import (
 func (d *Distributor) requiresLegacyTraceBatches() bool {
 	return d.cfg.LogReceivedSpans.Enabled ||
 		d.cfg.MetricReceivedSpans.Enabled ||
-		d.cfg.LogDiscardedSpans.Enabled ||
 		d.usage != nil
 }
 
