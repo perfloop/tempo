@@ -17,8 +17,9 @@ import (
 
 const (
 	perfloopRowGroups      = 64
-	perfloopTracesPerGroup = 256
+	perfloopTracesPerGroup = 1024
 	perfloopReadBufferSize = 4 * 1024
+	perfloopDurationStride = 1_000_000
 )
 
 type perfloopSelectiveDurationFixture struct {
@@ -90,7 +91,7 @@ func newPerfloopSelectiveDurationFixture(tb testing.TB, rowGroups, tracesPerGrou
 
 	for group := range rowGroups {
 		for trace := range tracesPerGroup {
-			durationMS := uint64(group*1000 + trace + 1)
+			durationMS := perfloopDurationMS(group, trace)
 			traceID := make([]byte, 16)
 			binary.BigEndian.PutUint64(traceID[8:], uint64(group*tracesPerGroup+trace+1))
 			start := uint64(time.Unix(1_700_000_000+int64(group), 0).UnixNano())
@@ -119,10 +120,10 @@ func newPerfloopSelectiveDurationFixture(tb testing.TB, rowGroups, tracesPerGrou
 		tb.Fatalf("completing benchmark block: %v", err)
 	}
 
-	missDurationMS := uint32(rowGroups*1000 + tracesPerGroup + 1)
+	missDurationMS := uint32(rowGroups*perfloopDurationStride + 1)
 	return perfloopSelectiveDurationFixture{
 		block: newBackendBlock(newMeta, reader),
-		hit:   perfloopDurationRequest(uint32((rowGroups/2)*1000 + 1)),
+		hit:   perfloopDurationRequest(uint32(perfloopDurationMS(rowGroups/2, 0))),
 		misses: [2]*tempopb.SearchRequest{
 			perfloopDurationRequest(missDurationMS),
 			perfloopDurationRequest(missDurationMS + 1),
@@ -134,6 +135,10 @@ func perfloopSelectiveDurationOptions() common.SearchOptions {
 	opts := common.DefaultSearchOptions()
 	opts.ReadBufferSize = perfloopReadBufferSize
 	return opts
+}
+
+func perfloopDurationMS(group, trace int) uint64 {
+	return uint64(group*perfloopDurationStride + (trace*7919)%999_983 + 1)
 }
 
 func perfloopDurationRequest(durationMS uint32) *tempopb.SearchRequest {
