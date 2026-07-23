@@ -290,15 +290,12 @@ func pdataSpanIDToBytes(spanID pcommon.SpanID) []byte {
 	return append([]byte(nil), spanID[:]...)
 }
 
-// pdataRebatchWireDetails holds the OTLP fields pdata retains internally but
-// does not expose through its public trace API. The payload is always produced
-// by ptrace.ProtoMarshaler immediately before this scan, so its wire shape is
-// valid and no external-wire error handling belongs on this hot path.
-type pdataRebatchWireDetails struct {
-	requiresLegacyRebatch bool
-}
-
-func pdataRebatchWireDetailsFromPayload(payload []byte) pdataRebatchWireDetails {
+// pdataPayloadRequiresLegacyRebatch recognizes OTLP fields pdata retains
+// internally but does not expose through its public trace API. The payload is
+// always produced by ptrace.ProtoMarshaler immediately before this scan, so its
+// wire shape is valid and no external-wire error handling belongs on this hot
+// path.
+func pdataPayloadRequiresLegacyRebatch(payload []byte) bool {
 	for len(payload) > 0 {
 		fieldNumber, fieldPayload, rest := nextPdataWireField(payload)
 		payload = rest
@@ -308,10 +305,10 @@ func pdataRebatchWireDetailsFromPayload(payload []byte) pdataRebatchWireDetails 
 
 		resourceSpans, _ := protowire.ConsumeBytes(fieldPayload)
 		if wirePayloadRequiresLegacyRebatch(resourceSpans, otlpWireResourceSpans) {
-			return pdataRebatchWireDetails{requiresLegacyRebatch: true}
+			return true
 		}
 	}
-	return pdataRebatchWireDetails{}
+	return false
 }
 
 type otlpWireMessage uint8

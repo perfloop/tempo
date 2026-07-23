@@ -26,8 +26,7 @@ func TestRequestsByTraceIDFromPdataMatchesWireRebatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wireDetails := pdataRebatchWireDetailsFromPayload(encoded)
-	if wireDetails.requiresLegacyRebatch {
+	if pdataPayloadRequiresLegacyRebatch(encoded) {
 		t.Fatal("test trace unexpectedly selected the legacy path")
 	}
 	legacyTrace := &tempopb.Trace{}
@@ -78,7 +77,7 @@ func TestRequestsByTraceIDFromPdataMatchesWireRebatch(t *testing.T) {
 	}
 }
 
-func TestPdataRebatchWireDetailsSelectLegacy(t *testing.T) {
+func TestPdataPayloadSelectsLegacyRebatch(t *testing.T) {
 	t.Run("resource entity references", func(t *testing.T) {
 		trace := pdataRebatchTestTrace()
 		trace.ResourceSpans[0].Resource.EntityRefs = []*v1_common.EntityRef{{
@@ -89,7 +88,7 @@ func TestPdataRebatchWireDetailsSelectLegacy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !pdataRebatchWireDetailsFromPayload(payload).requiresLegacyRebatch {
+		if !pdataPayloadRequiresLegacyRebatch(payload) {
 			t.Fatal("resource entity references unexpectedly selected the direct path")
 		}
 	})
@@ -106,7 +105,7 @@ func TestPdataRebatchWireDetailsSelectLegacy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !pdataRebatchWireDetailsFromPayload(stringIndexPayload).requiresLegacyRebatch {
+		if !pdataPayloadRequiresLegacyRebatch(stringIndexPayload) {
 			t.Fatal("string-table value unexpectedly selected the direct path")
 		}
 
@@ -128,7 +127,7 @@ func TestPdataRebatchWireDetailsSelectLegacy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !pdataRebatchWireDetailsFromPayload(keyIndexPayload).requiresLegacyRebatch {
+		if !pdataPayloadRequiresLegacyRebatch(keyIndexPayload) {
 			t.Fatal("literal or nested string-table key unexpectedly selected the direct path")
 		}
 	})
@@ -136,15 +135,21 @@ func TestPdataRebatchWireDetailsSelectLegacy(t *testing.T) {
 
 func TestPushTracesPdataRebatchPreservesDeliveredWireForms(t *testing.T) {
 	for _, testCase := range []struct {
-		name   string
-		source func() *tempopb.Trace
+		name           string
+		source         func() *tempopb.Trace
+		requiresLegacy bool
 	}{
 		{
 			name:   "public values",
 			source: pdataRebatchTestTrace,
 		},
 		{
-			name: "resource entity references",
+			name:   "omitted nested messages",
+			source: pdataRebatchTraceWithOmittedNestedMessages,
+		},
+		{
+			name:           "resource entity references",
+			requiresLegacy: true,
 			source: func() *tempopb.Trace {
 				trace := pdataRebatchTestTrace()
 				trace.ResourceSpans[0].Resource.EntityRefs = []*v1_common.EntityRef{{
@@ -155,7 +160,8 @@ func TestPushTracesPdataRebatchPreservesDeliveredWireForms(t *testing.T) {
 			},
 		},
 		{
-			name: "profiling key string index",
+			name:           "profiling key string index",
+			requiresLegacy: true,
 			source: func() *tempopb.Trace {
 				trace := pdataRebatchTestTrace()
 				trace.ResourceSpans[0].Resource.Attributes = append(trace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
@@ -167,7 +173,8 @@ func TestPushTracesPdataRebatchPreservesDeliveredWireForms(t *testing.T) {
 			},
 		},
 		{
-			name: "profiling value string index",
+			name:           "profiling value string index",
+			requiresLegacy: true,
 			source: func() *tempopb.Trace {
 				trace := pdataRebatchTestTrace()
 				trace.ResourceSpans[0].Resource.Attributes = append(trace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
@@ -190,6 +197,14 @@ func TestPushTracesPdataRebatchPreservesDeliveredWireForms(t *testing.T) {
 			}
 
 			traces := pdataTracesFromTrace(t, testCase.source())
+			payload, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(traces)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requiresLegacy := pdataPayloadRequiresLegacyRebatch(payload)
+			if requiresLegacy != testCase.requiresLegacy {
+				t.Fatalf("legacy selection = %t, want %t", requiresLegacy, testCase.requiresLegacy)
+			}
 			expected := legacyDeliveredPdataTraces(t, traces, "test", d.cfg.MaxAttributeBytes)
 			if _, err := d.PushTraces(ctx, traces); err != nil {
 				t.Fatal(err)
@@ -308,6 +323,16 @@ func pdataRebatchTestTrace() *tempopb.Trace {
 				pdataRebatchSpan(traceIDA, pdataRebatchSpanID(1), "first"),
 				pdataRebatchSpan(traceIDB, pdataRebatchSpanID(2), "second"),
 			},
+		}},
+	}}}
+}
+
+func pdataRebatchTraceWithOmittedNestedMessages() *tempopb.Trace {
+	span := pdataRebatchSpan(pdataRebatchTraceID(3), pdataRebatchSpanID(3), "without nested messages")
+	span.Status = nil
+	return &tempopb.Trace{ResourceSpans: []*v1.ResourceSpans{{
+		ScopeSpans: []*v1.ScopeSpans{{
+			Spans: []*v1.Span{span},
 		}},
 	}}}
 }

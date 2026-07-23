@@ -492,10 +492,8 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		truncationExample        *truncatedAttrInfo
 	)
 	useLegacyRebatch := d.requiresLegacyTraceBatches()
-	var wireDetails pdataRebatchWireDetails
 	if !useLegacyRebatch {
-		wireDetails = pdataRebatchWireDetailsFromPayload(convert)
-		useLegacyRebatch = wireDetails.requiresLegacyRebatch
+		useLegacyRebatch = pdataPayloadRequiresLegacyRebatch(convert)
 	}
 	if useLegacyRebatch {
 		// tempopb.Trace is wire-compatible with ExportTraceServiceRequest
