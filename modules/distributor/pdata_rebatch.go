@@ -29,6 +29,28 @@ func (d *Distributor) requiresLegacyTraceBatches() bool {
 		d.usage != nil
 }
 
+// pdataHasInvalidTraceOrSpanID mirrors the direct rebatcher's ID validation.
+// Discarded-span logging retains the legacy route for rejected requests so its
+// configured output stays identical without paying a second decode on errors.
+func pdataHasInvalidTraceOrSpanID(tracesData ptrace.Traces) bool {
+	resourceSpans := tracesData.ResourceSpans()
+	for resourceIndex := 0; resourceIndex < resourceSpans.Len(); resourceIndex++ {
+		scopeSpans := resourceSpans.At(resourceIndex).ScopeSpans()
+		for scopeIndex := 0; scopeIndex < scopeSpans.Len(); scopeIndex++ {
+			spans := scopeSpans.At(scopeIndex).Spans()
+			for spanIndex := 0; spanIndex < spans.Len(); spanIndex++ {
+				span := spans.At(spanIndex)
+				traceID := span.TraceID()
+				spanID := span.SpanID()
+				if !validation.ValidTraceID(traceID[:]) || !validation.ValidSpanID(spanID[:]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // requestsByTraceIDFromPdata rebuilds the trace-owned fragments directly from
 // pdata. The pdata API preserves the OTLP values that Tempo needs for traces,
 // while avoiding the temporary tempopb.Trace tree produced by an OTLP wire

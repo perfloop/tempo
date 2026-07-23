@@ -1498,6 +1498,9 @@ func TestLogDiscardedSpansMatchesLegacyTruncation(t *testing.T) {
 		makeResourceSpans("test-service", []*v1.ScopeSpans{makeScope(span)},
 			makeAttribute("resource-oversized-key", "resource-oversized-value")),
 	})
+	if !pdataHasInvalidTraceOrSpanID(traces) {
+		t.Fatal("invalid SpanID unexpectedly passed direct-rebatch validation")
+	}
 
 	_, err := direct.PushTraces(ctx, traces)
 	require.Error(t, err)
