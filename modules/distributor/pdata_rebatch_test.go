@@ -2,13 +2,16 @@ package distributor
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
+	"flag"
 	"reflect"
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 
+	"github.com/grafana/tempo/modules/overrides"
 	"github.com/grafana/tempo/pkg/tempopb"
 	v1_common "github.com/grafana/tempo/pkg/tempopb/common/v1"
 	v1_resource "github.com/grafana/tempo/pkg/tempopb/resource/v1"
@@ -23,7 +26,8 @@ func TestRequestsByTraceIDFromPdataMatchesWireRebatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !canRebatchPdataDirectly(traces) || tracePayloadHasResourceEntityRefs(encoded) {
+	wireDetails := pdataRebatchWireDetailsFromPayload(encoded)
+	if wireDetails.requiresLegacyRebatch {
 		t.Fatal("test trace unexpectedly selected the legacy path")
 	}
 	legacyTrace := &tempopb.Trace{}
@@ -74,43 +78,169 @@ func TestRequestsByTraceIDFromPdataMatchesWireRebatch(t *testing.T) {
 	}
 }
 
-func TestDirectRebatchFallbacksForPdataFieldsItCannotRead(t *testing.T) {
-	base := pdataRebatchTestTrace()
-	base.ResourceSpans[0].Resource.EntityRefs = []*v1_common.EntityRef{{
-		Type:   "service",
-		IdKeys: []string{"service.name"},
-	}}
-	traces := pdataTracesFromTrace(t, base)
-	if !canRebatchPdataDirectly(traces) {
-		t.Fatal("entity-reference trace unexpectedly failed the public pdata check")
+func TestPdataRebatchWireDetailsSelectLegacy(t *testing.T) {
+	t.Run("resource entity references", func(t *testing.T) {
+		trace := pdataRebatchTestTrace()
+		trace.ResourceSpans[0].Resource.EntityRefs = []*v1_common.EntityRef{{
+			Type:   "service",
+			IdKeys: []string{"service.name"},
+		}}
+		payload, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(pdataTracesFromTrace(t, trace))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !pdataRebatchWireDetailsFromPayload(payload).requiresLegacyRebatch {
+			t.Fatal("resource entity references unexpectedly selected the direct path")
+		}
+	})
+
+	t.Run("string-table fields", func(t *testing.T) {
+		stringIndexTrace := pdataRebatchTestTrace()
+		stringIndexTrace.ResourceSpans[0].Resource.Attributes = append(stringIndexTrace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
+			Key: "string-index",
+			Value: &v1_common.AnyValue{Value: &v1_common.AnyValue_StringValueStrindex{
+				StringValueStrindex: 1,
+			}},
+		})
+		stringIndexPayload, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(pdataTracesFromTrace(t, stringIndexTrace))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !pdataRebatchWireDetailsFromPayload(stringIndexPayload).requiresLegacyRebatch {
+			t.Fatal("string-table value unexpectedly selected the direct path")
+		}
+
+		keyIndexTrace := pdataRebatchTestTrace()
+		keyIndexTrace.ResourceSpans[0].Resource.Attributes = append(keyIndexTrace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
+			Key:         "literal-key",
+			KeyStrindex: 1,
+			Value:       &v1_common.AnyValue{Value: &v1_common.AnyValue_StringValue{StringValue: "indexed key"}},
+		})
+		keyIndexTrace.ResourceSpans[0].Resource.Attributes = append(keyIndexTrace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
+			Key: "nested-key",
+			Value: &v1_common.AnyValue{Value: &v1_common.AnyValue_KvlistValue{KvlistValue: &v1_common.KeyValueList{Values: []*v1_common.KeyValue{{
+				Key:         "nested-literal-key",
+				KeyStrindex: 2,
+				Value:       &v1_common.AnyValue{Value: &v1_common.AnyValue_StringValue{StringValue: "nested indexed key"}},
+			}}}}},
+		})
+		keyIndexPayload, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(pdataTracesFromTrace(t, keyIndexTrace))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !pdataRebatchWireDetailsFromPayload(keyIndexPayload).requiresLegacyRebatch {
+			t.Fatal("literal or nested string-table key unexpectedly selected the direct path")
+		}
+	})
+}
+
+func TestPushTracesPdataRebatchPreservesDeliveredWireForms(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		source func() *tempopb.Trace
+	}{
+		{
+			name:   "public values",
+			source: pdataRebatchTestTrace,
+		},
+		{
+			name: "resource entity references",
+			source: func() *tempopb.Trace {
+				trace := pdataRebatchTestTrace()
+				trace.ResourceSpans[0].Resource.EntityRefs = []*v1_common.EntityRef{{
+					Type:   "service",
+					IdKeys: []string{"service.name"},
+				}}
+				return trace
+			},
+		},
+		{
+			name: "profiling key string index",
+			source: func() *tempopb.Trace {
+				trace := pdataRebatchTestTrace()
+				trace.ResourceSpans[0].Resource.Attributes = append(trace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
+					Key:         "literal-key",
+					KeyStrindex: 1,
+					Value:       &v1_common.AnyValue{Value: &v1_common.AnyValue_StringValue{StringValue: "indexed key"}},
+				})
+				return trace
+			},
+		},
+		{
+			name: "profiling value string index",
+			source: func() *tempopb.Trace {
+				trace := pdataRebatchTestTrace()
+				trace.ResourceSpans[0].Resource.Attributes = append(trace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
+					Key:   "string-index",
+					Value: &v1_common.AnyValue{Value: &v1_common.AnyValue_StringValueStrindex{StringValueStrindex: 1}},
+				})
+				return trace
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			limits := overrides.Config{}
+			limits.RegisterFlagsAndApplyDefaults(&flag.FlagSet{})
+			d := prepare(t, limits, nil)
+
+			var delivered *tempopb.PushBytesRequest
+			d.localPushTargets.LiveStore = func(_ context.Context, request *tempopb.PushBytesRequest) (*tempopb.PushResponse, error) {
+				delivered = request
+				return &tempopb.PushResponse{}, nil
+			}
+
+			traces := pdataTracesFromTrace(t, testCase.source())
+			expected := legacyDeliveredPdataTraces(t, traces, "test", d.cfg.MaxAttributeBytes)
+			if _, err := d.PushTraces(ctx, traces); err != nil {
+				t.Fatal(err)
+			}
+			if delivered == nil {
+				t.Fatal("local live-store did not receive routed fragments")
+			}
+			if len(delivered.Traces) != len(expected) || len(delivered.Ids) != len(expected) {
+				t.Fatalf("got %d fragments and %d IDs, want %d", len(delivered.Traces), len(delivered.Ids), len(expected))
+			}
+			for index, encodedTrace := range delivered.Traces {
+				traceID := hex.EncodeToString(delivered.Ids[index])
+				want, ok := expected[traceID]
+				if !ok {
+					t.Fatalf("unexpected routed trace %s", traceID)
+				}
+				got := &tempopb.Trace{}
+				if err := got.Unmarshal(encodedTrace.Slice); err != nil {
+					t.Fatal(err)
+				}
+				if !proto.Equal(want, got) {
+					t.Fatalf("routed trace %s differs from the legacy payload\nwant: %s\n got: %s", traceID, want, got)
+				}
+				delete(expected, traceID)
+			}
+			if len(expected) != 0 {
+				t.Fatalf("missing routed traces: %v", expected)
+			}
+		})
 	}
+}
+
+func legacyDeliveredPdataTraces(t *testing.T, traces ptrace.Traces, userID string, maxAttributeBytes int) map[string]*tempopb.Trace {
+	t.Helper()
 	payload, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(traces)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !tracePayloadHasResourceEntityRefs(payload) {
-		t.Fatal("resource entity references did not select the legacy path")
+	legacy := &tempopb.Trace{}
+	if err := legacy.Unmarshal(payload); err != nil {
+		t.Fatal(err)
 	}
-
-	stringIndexTrace := pdataRebatchTestTrace()
-	stringIndexTrace.ResourceSpans[0].Resource.Attributes = append(stringIndexTrace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
-		Key: "string-index",
-		Value: &v1_common.AnyValue{Value: &v1_common.AnyValue_StringValueStrindex{
-			StringValueStrindex: 1,
-		}},
-	})
-	if canRebatchPdataDirectly(pdataTracesFromTrace(t, stringIndexTrace)) {
-		t.Fatal("string-table value unexpectedly selected the direct path")
+	_, rebatched, _, _, err := requestsByTraceID(legacy.ResourceSpans, userID, traces.SpanCount(), maxAttributeBytes)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	keyIndexTrace := pdataRebatchTestTrace()
-	keyIndexTrace.ResourceSpans[0].Resource.Attributes = append(keyIndexTrace.ResourceSpans[0].Resource.Attributes, &v1_common.KeyValue{
-		KeyStrindex: 1,
-		Value:       &v1_common.AnyValue{Value: &v1_common.AnyValue_StringValue{StringValue: "indexed key"}},
-	})
-	if canRebatchPdataDirectly(pdataTracesFromTrace(t, keyIndexTrace)) {
-		t.Fatal("string-table key unexpectedly selected the direct path")
+	result := make(map[string]*tempopb.Trace, len(rebatched))
+	for _, trace := range rebatched {
+		result[hex.EncodeToString(trace.id)] = trace.trace
 	}
+	return result
 }
 
 type rebatchedTraceInfo struct {

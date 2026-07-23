@@ -491,7 +491,13 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		truncatedAttributesCount truncatedAttributesCount
 		truncationExample        *truncatedAttrInfo
 	)
-	if d.requiresLegacyTraceBatches() || !canRebatchPdataDirectly(traces) || tracePayloadHasResourceEntityRefs(convert) {
+	useLegacyRebatch := d.requiresLegacyTraceBatches()
+	var wireDetails pdataRebatchWireDetails
+	if !useLegacyRebatch {
+		wireDetails = pdataRebatchWireDetailsFromPayload(convert)
+		useLegacyRebatch = wireDetails.requiresLegacyRebatch
+	}
+	if useLegacyRebatch {
 		// tempopb.Trace is wire-compatible with ExportTraceServiceRequest
 		// used by ToOtlpProtoBytes.
 		trace := tempopb.Trace{}

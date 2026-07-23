@@ -290,157 +290,126 @@ func pdataSpanIDToBytes(spanID pcommon.SpanID) []byte {
 	return append([]byte(nil), spanID[:]...)
 }
 
-// canRebatchPdataDirectly excludes pdata representations that cannot be read
-// faithfully through the public pdata API. Empty values may represent the
-// profiling-only string-table form, and an empty key may represent key_strindex.
-// Both retain the established wire decode path instead of being normalized away.
-func canRebatchPdataDirectly(tracesData ptrace.Traces) bool {
-	resourceSpans := tracesData.ResourceSpans()
-	for resourceIndex := 0; resourceIndex < resourceSpans.Len(); resourceIndex++ {
-		resourceSpan := resourceSpans.At(resourceIndex)
-		if !canConvertPdataAttributes(resourceSpan.Resource().Attributes()) {
-			return false
-		}
-
-		scopeSpans := resourceSpan.ScopeSpans()
-		for scopeIndex := 0; scopeIndex < scopeSpans.Len(); scopeIndex++ {
-			scopeSpan := scopeSpans.At(scopeIndex)
-			if !canConvertPdataAttributes(scopeSpan.Scope().Attributes()) {
-				return false
-			}
-
-			spans := scopeSpan.Spans()
-			for spanIndex := 0; spanIndex < spans.Len(); spanIndex++ {
-				span := spans.At(spanIndex)
-				if !canConvertPdataAttributes(span.Attributes()) {
-					return false
-				}
-				events := span.Events()
-				for eventIndex := 0; eventIndex < events.Len(); eventIndex++ {
-					if !canConvertPdataAttributes(events.At(eventIndex).Attributes()) {
-						return false
-					}
-				}
-				links := span.Links()
-				for linkIndex := 0; linkIndex < links.Len(); linkIndex++ {
-					if !canConvertPdataAttributes(links.At(linkIndex).Attributes()) {
-						return false
-					}
-				}
-			}
-		}
-	}
-	return true
+// pdataRebatchWireDetails holds the OTLP fields pdata retains internally but
+// does not expose through its public trace API. The payload is always produced
+// by ptrace.ProtoMarshaler immediately before this scan, so its wire shape is
+// valid and no external-wire error handling belongs on this hot path.
+type pdataRebatchWireDetails struct {
+	requiresLegacyRebatch bool
 }
 
-func canConvertPdataAttributes(attributes pcommon.Map) bool {
-	convertible := true
-	attributes.Range(func(key string, value pcommon.Value) bool {
-		if key == "" || !canConvertPdataValue(value) {
-			convertible = false
-			return false
-		}
-		return true
-	})
-	return convertible
-}
-
-func canConvertPdataValue(value pcommon.Value) bool {
-	switch value.Type() {
-	case pcommon.ValueTypeStr, pcommon.ValueTypeBool, pcommon.ValueTypeInt, pcommon.ValueTypeDouble, pcommon.ValueTypeBytes:
-		return true
-	case pcommon.ValueTypeMap:
-		return canConvertPdataAttributes(value.Map())
-	case pcommon.ValueTypeSlice:
-		values := value.Slice()
-		for index := 0; index < values.Len(); index++ {
-			if !canConvertPdataValue(values.At(index)) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
-}
-
-// tracePayloadHasResourceEntityRefs recognizes the one Resource field pdata
-// retains internally but does not expose through pcommon.Resource. A malformed
-// payload is treated as unsupported, which keeps the existing decode route.
-func tracePayloadHasResourceEntityRefs(payload []byte) bool {
+func pdataRebatchWireDetailsFromPayload(payload []byte) pdataRebatchWireDetails {
 	for len(payload) > 0 {
-		fieldNumber, fieldType, tagSize := protowire.ConsumeTag(payload)
-		if tagSize < 0 {
-			return true
-		}
-		payload = payload[tagSize:]
-
-		if fieldNumber == 1 {
-			if fieldType != protowire.BytesType {
-				return true
-			}
-			resourceSpans, fieldSize := protowire.ConsumeBytes(payload)
-			if fieldSize < 0 || resourceSpansHasEntityRefs(resourceSpans) {
-				return true
-			}
-			payload = payload[fieldSize:]
+		fieldNumber, fieldPayload, rest := nextPdataWireField(payload)
+		payload = rest
+		if fieldNumber != 1 {
 			continue
 		}
 
-		fieldSize := protowire.ConsumeFieldValue(fieldNumber, fieldType, payload)
-		if fieldSize < 0 {
+		resourceSpans, _ := protowire.ConsumeBytes(fieldPayload)
+		if wirePayloadRequiresLegacyRebatch(resourceSpans, otlpWireResourceSpans) {
+			return pdataRebatchWireDetails{requiresLegacyRebatch: true}
+		}
+	}
+	return pdataRebatchWireDetails{}
+}
+
+type otlpWireMessage uint8
+
+const (
+	otlpWireResourceSpans otlpWireMessage = iota
+	otlpWireResource
+	otlpWireScopeSpans
+	otlpWireInstrumentationScope
+	otlpWireSpan
+	otlpWireEvent
+	otlpWireLink
+	otlpWireKeyValue
+	otlpWireAnyValue
+	otlpWireArray
+	otlpWireKeyValueList
+)
+
+func wirePayloadRequiresLegacyRebatch(payload []byte, message otlpWireMessage) bool {
+	for len(payload) > 0 {
+		fieldNumber, fieldPayload, rest := nextPdataWireField(payload)
+		payload = rest
+
+		if message == otlpWireResource && fieldNumber == 3 {
+			// pcommon.Resource has no accessor for EntityRefs.
 			return true
 		}
-		payload = payload[fieldSize:]
+		if message == otlpWireKeyValue && fieldNumber == 3 {
+			// pcommon.Map exposes Key but not KeyStrindex.
+			return true
+		}
+		if message == otlpWireAnyValue && fieldNumber == 8 {
+			// pcommon.Value has no accessor for StringValueStrindex.
+			return true
+		}
+		if child, ok := otlpWireChild(message, fieldNumber); ok {
+			value, _ := protowire.ConsumeBytes(fieldPayload)
+			if wirePayloadRequiresLegacyRebatch(value, child) {
+				return true
+			}
+		}
 	}
 	return false
 }
 
-func resourceSpansHasEntityRefs(payload []byte) bool {
-	for len(payload) > 0 {
-		fieldNumber, fieldType, tagSize := protowire.ConsumeTag(payload)
-		if tagSize < 0 {
-			return true
+func otlpWireChild(message otlpWireMessage, fieldNumber protowire.Number) (otlpWireMessage, bool) {
+	switch message {
+	case otlpWireResourceSpans:
+		switch fieldNumber {
+		case 1:
+			return otlpWireResource, true
+		case 2:
+			return otlpWireScopeSpans, true
 		}
-		payload = payload[tagSize:]
-
-		if fieldNumber == 1 {
-			if fieldType != protowire.BytesType {
-				return true
-			}
-			resource, fieldSize := protowire.ConsumeBytes(payload)
-			if fieldSize < 0 || resourceHasEntityRefs(resource) {
-				return true
-			}
-			payload = payload[fieldSize:]
-			continue
+	case otlpWireResource:
+		return otlpWireKeyValue, fieldNumber == 1
+	case otlpWireScopeSpans:
+		switch fieldNumber {
+		case 1:
+			return otlpWireInstrumentationScope, true
+		case 2:
+			return otlpWireSpan, true
 		}
-
-		fieldSize := protowire.ConsumeFieldValue(fieldNumber, fieldType, payload)
-		if fieldSize < 0 {
-			return true
+	case otlpWireInstrumentationScope:
+		return otlpWireKeyValue, fieldNumber == 3
+	case otlpWireSpan:
+		switch fieldNumber {
+		case 9:
+			return otlpWireKeyValue, true
+		case 11:
+			return otlpWireEvent, true
+		case 13:
+			return otlpWireLink, true
 		}
-		payload = payload[fieldSize:]
+	case otlpWireEvent:
+		return otlpWireKeyValue, fieldNumber == 3
+	case otlpWireLink:
+		return otlpWireKeyValue, fieldNumber == 4
+	case otlpWireKeyValue:
+		return otlpWireAnyValue, fieldNumber == 2
+	case otlpWireAnyValue:
+		switch fieldNumber {
+		case 5:
+			return otlpWireArray, true
+		case 6:
+			return otlpWireKeyValueList, true
+		}
+	case otlpWireArray:
+		return otlpWireAnyValue, fieldNumber == 1
+	case otlpWireKeyValueList:
+		return otlpWireKeyValue, fieldNumber == 1
 	}
-	return false
+	return 0, false
 }
 
-func resourceHasEntityRefs(payload []byte) bool {
-	for len(payload) > 0 {
-		fieldNumber, fieldType, tagSize := protowire.ConsumeTag(payload)
-		if tagSize < 0 {
-			return true
-		}
-		payload = payload[tagSize:]
-		if fieldNumber == 3 {
-			return true
-		}
-
-		fieldSize := protowire.ConsumeFieldValue(fieldNumber, fieldType, payload)
-		if fieldSize < 0 {
-			return true
-		}
-		payload = payload[fieldSize:]
-	}
-	return false
+func nextPdataWireField(payload []byte) (fieldNumber protowire.Number, fieldPayload, rest []byte) {
+	fieldNumber, fieldType, tagSize := protowire.ConsumeTag(payload)
+	fieldPayload = payload[tagSize:]
+	fieldSize := protowire.ConsumeFieldValue(fieldNumber, fieldType, fieldPayload)
+	return fieldNumber, fieldPayload, fieldPayload[fieldSize:]
 }
