@@ -234,9 +234,12 @@ func TestPushTracesDeliversRoutedBatchesToGenerator(t *testing.T) {
 	if err := services.StartAndAwaitRunning(context.Background(), d.generatorForwarder); err != nil {
 		t.Fatal(err)
 	}
+	stopped := false
 	defer func() {
-		if err := services.StopAndAwaitTerminated(context.Background(), d.generatorForwarder); err != nil {
-			t.Fatal(err)
+		if !stopped {
+			if err := services.StopAndAwaitTerminated(context.Background(), d.generatorForwarder); err != nil {
+				t.Error(err)
+			}
 		}
 	}()
 
@@ -244,11 +247,17 @@ func TestPushTracesDeliversRoutedBatchesToGenerator(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// generatorForwarder.stop drains its queues before returning, so stopping it
+	// gives this test a deterministic delivery barrier without a wall-clock race.
+	if err := services.StopAndAwaitTerminated(context.Background(), d.generatorForwarder); err != nil {
+		t.Fatal(err)
+	}
+	stopped = true
 	var request *tempopb.PushSpansRequest
 	select {
 	case request = <-generatorRequests:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the local generator request")
+	default:
+		t.Fatal("generator queue did not drain the routed request")
 	}
 	if len(request.Batches) != 2 {
 		t.Fatalf("got %d generator batches, want two trace-owned batches", len(request.Batches))
