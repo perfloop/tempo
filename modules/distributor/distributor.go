@@ -474,45 +474,58 @@ func (d *Distributor) PushTraces(ctx context.Context, traces ptrace.Traces) (*te
 		return nil, err
 	}
 
-	// Convert to bytes and back. This is unfortunate for efficiency, but it works
-	// around the otel-collector internalization of otel-proto which Tempo also uses.
+	maxAttributeBytes := d.getMaxAttributeBytes(userID)
+
+	// Keep a wire representation available for the legacy consumers and for the
+	// conservative entity-reference check below. Normal trace ingestion rebuilds
+	// its routed fragments directly from pdata instead of decoding this payload
+	// into a request-wide tempopb tree only to split it apart again.
 	convert, err := (&ptrace.ProtoMarshaler{}).MarshalTraces(traces)
 	if err != nil {
 		return nil, err
 	}
 
-	// tempopb.Trace is wire-compatible with ExportTraceServiceRequest
-	// used by ToOtlpProtoBytes
-	trace := tempopb.Trace{}
-	err = trace.Unmarshal(convert)
-	if err != nil {
-		return nil, err
-	}
+	var (
+		ringTokens               []uint32
+		rebatchedTraces          []*rebatchedTrace
+		truncatedAttributesCount truncatedAttributesCount
+		truncationExample        *truncatedAttrInfo
+	)
+	if d.requiresLegacyTraceBatches() || !canRebatchPdataDirectly(traces) || tracePayloadHasResourceEntityRefs(convert) {
+		// tempopb.Trace is wire-compatible with ExportTraceServiceRequest
+		// used by ToOtlpProtoBytes.
+		trace := tempopb.Trace{}
+		if err = trace.Unmarshal(convert); err != nil {
+			return nil, err
+		}
+		batches := trace.ResourceSpans
 
-	batches := trace.ResourceSpans
+		logReceivedSpans(batches, &d.cfg.LogReceivedSpans, d.logger)
+		if d.cfg.MetricReceivedSpans.Enabled {
+			metricSpans(batches, userID, &d.cfg.MetricReceivedSpans)
+		}
+		metricBytesIngested.WithLabelValues(userID).Add(float64(size))
+		metricSpansIngested.WithLabelValues(userID).Add(float64(spanCount))
+		statBytesReceived.Inc(int64(size))
+		statSpansReceived.Inc(int64(spanCount))
+		if d.usage != nil {
+			d.usage.Observe(userID, batches)
+		}
 
-	logReceivedSpans(batches, &d.cfg.LogReceivedSpans, d.logger)
-	if d.cfg.MetricReceivedSpans.Enabled {
-		metricSpans(batches, userID, &d.cfg.MetricReceivedSpans)
-	}
-
-	metricBytesIngested.WithLabelValues(userID).Add(float64(size))
-	metricSpansIngested.WithLabelValues(userID).Add(float64(spanCount))
-
-	statBytesReceived.Inc(int64(size))
-	statSpansReceived.Inc(int64(spanCount))
-
-	// Usage tracking
-	if d.usage != nil {
-		d.usage.Observe(userID, batches)
-	}
-
-	maxAttributeBytes := d.getMaxAttributeBytes(userID)
-
-	ringTokens, rebatchedTraces, truncatedAttributesCount, truncationExample, err := requestsByTraceID(batches, userID, spanCount, maxAttributeBytes)
-	if err != nil {
-		logDiscardedResourceSpans(batches, userID, &d.cfg.LogDiscardedSpans, d.logger)
-		return nil, err
+		ringTokens, rebatchedTraces, truncatedAttributesCount, truncationExample, err = requestsByTraceID(batches, userID, spanCount, maxAttributeBytes)
+		if err != nil {
+			logDiscardedResourceSpans(batches, userID, &d.cfg.LogDiscardedSpans, d.logger)
+			return nil, err
+		}
+	} else {
+		metricBytesIngested.WithLabelValues(userID).Add(float64(size))
+		metricSpansIngested.WithLabelValues(userID).Add(float64(spanCount))
+		statBytesReceived.Inc(int64(size))
+		statSpansReceived.Inc(int64(spanCount))
+		ringTokens, rebatchedTraces, truncatedAttributesCount, truncationExample, err = requestsByTraceIDFromPdata(traces, userID, spanCount, maxAttributeBytes)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if truncatedAttributesCount.Total() > 0 {
